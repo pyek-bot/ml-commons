@@ -35,6 +35,8 @@ import org.opensearch.ml.helper.ModelAccessControlHelper;
 import org.opensearch.ml.model.MLModelCacheHelper;
 import org.opensearch.ml.model.MLModelManager;
 import org.opensearch.ml.settings.MLFeatureEnabledSetting;
+import org.opensearch.ml.stats.otel.counters.MLOperationalMetricsCounter;
+import org.opensearch.ml.stats.otel.metrics.OperationalMetric;
 import org.opensearch.ml.task.MLPredictTaskRunner;
 import org.opensearch.ml.task.MLTaskRunner;
 import org.opensearch.ml.utils.MLNodeUtils;
@@ -190,12 +192,18 @@ public class TransportPredictionTaskAction extends HandledTransportAction<Action
                                     );
                             }
                         }));
+
+                    // ToDo: add to right place
+                    MLOperationalMetricsCounter.getInstance()
+                            .incrementCounter(OperationalMetric.MODEL_PREDICT_COUNT, mlModel.getModelTags().addTag("status_code", 200));
                 }
 
                 @Override
                 public void onFailure(Exception e) {
                     log.error("Failed to find model " + modelId, e);
                     wrappedListener.onFailure(e);
+//                    MLOperationalMetricsCounter.getInstance()
+//                            .incrementCounter(OperationalMetric.MODEL_PREDICT_COUNT, mlModel.getModelTags().addTag("status_code", e.));
                 }
             };
 

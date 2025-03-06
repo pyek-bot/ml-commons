@@ -41,6 +41,7 @@ import org.opensearch.ml.common.model.TextEmbeddingModelConfig;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.Setter;
+import org.opensearch.telemetry.metrics.tags.Tags;
 
 @Getter
 public class MLModel implements ToXContentObject {
@@ -724,6 +725,16 @@ public class MLModel implements ToXContentObject {
     public static MLModel fromStream(StreamInput in) throws IOException {
         MLModel mlModel = new MLModel(in);
         return mlModel;
+    }
+
+    public Tags getModelTags() {
+        return Tags.create()
+                .addTag("type", algorithm == FunctionName.REMOTE ? "remote" : "local")
+                .addTag("provider", algorithm == FunctionName.REMOTE ? getRemoteModelType() : algorithm.name());
+    }
+
+    private String getRemoteModelType() {
+        return "remote_sub_tye";
     }
 
 }
