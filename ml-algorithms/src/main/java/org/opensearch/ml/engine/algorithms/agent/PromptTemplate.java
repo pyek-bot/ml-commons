@@ -29,8 +29,7 @@ public class PromptTemplate {
         + "Objective: ${parameters."
         + USER_PROMPT_FIELD
         + "} \n\n"
-        + "ALWAYS follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON \n\n"
-        + "Response Instructions: ${parameters."
+        + "${parameters."
         + DEEP_RESEARCH_RESPONSE_FORMAT_FIELD
         + "}";
 
@@ -49,7 +48,6 @@ public class PromptTemplate {
         + "${parameters."
         + REVAL_PROMPT_FIELD
         + "} \n\n"
-        + "ALWAYS follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON \n\n"
         + "${parameters."
         + DEEP_RESEARCH_RESPONSE_FORMAT_FIELD
         + "}";
@@ -63,8 +61,7 @@ public class PromptTemplate {
         + "You have currently executed the following steps: \n[${parameters."
         + COMPLETED_STEPS_FIELD
         + "}] \n\n"
-        + "ALWAYS follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON \n\n"
-        + "Response Instructions: ${parameters."
+        + "${parameters."
         + DEEP_RESEARCH_RESPONSE_FORMAT_FIELD
         + "}";
 
@@ -77,6 +74,8 @@ public class PromptTemplate {
     public static final String DEEP_RESEARCH_RESPONSE_FORMAT = "${parameters."
         + DEFAULT_PROMPT_TOOLS_FIELD
         + ":-} \n"
+        + "Response Instructions: \n"
+        + "ALWAYS follow the given response instructions. Do not return any content that does not follow the response instructions. Do not add anything before or after the expected JSON \n"
         + "Always respond with a valid JSON object that strictly follows the below schema:\n"
         + "{\n"
         + "\t\"steps\": array[string], \n"
@@ -100,6 +99,4 @@ public class PromptTemplate {
         + "2. DO NOT add any content before or after the JSON \n"
         + "3. ONLY respond with a pure JSON object \n"
         + "4. DO NOT USE ANY TOOLS. TOOLS ARE PROVIDED ONLY FOR YOU TO MAKE A PLAN.";
-
-    public static final String DEFAULT_TOOLS_PLACEHOLDERS_PROMPT = "${parameters.prompt_tools:-}";
 }

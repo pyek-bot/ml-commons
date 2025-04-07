@@ -1,12 +1,14 @@
 package org.opensearch.ml.engine.algorithms.agent;
 
-import static org.opensearch.ml.common.conversation.ActionConstants.AI_RESPONSE_FIELD;
+import static org.opensearch.ml.common.conversation.ConversationalIndexConstants.INTERACTIONS_INPUT_FIELD;
+import static org.opensearch.ml.common.conversation.ConversationalIndexConstants.INTERACTIONS_RESPONSE_FIELD;
 import static org.opensearch.ml.common.utils.StringUtils.isJson;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.LLM_INTERFACE_BEDROCK_CONVERSE_CLAUDE;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.LLM_INTERFACE_BEDROCK_CONVERSE_DEEPSEEK_R1;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.LLM_RESPONSE_FILTER;
-import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.addToolsToFunctionCalling;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.createTools;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getMlToolSpecs;
-import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getToolNames;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.LLM_INTERFACE;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.saveTraceData;
 import static org.opensearch.ml.engine.algorithms.agent.PromptTemplate.DEEP_RESEARCH_PLANNER_PROMPT;
@@ -20,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -49,8 +52,6 @@ import org.opensearch.ml.common.transport.execute.MLExecuteTaskRequest;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskRequest;
 import org.opensearch.ml.common.utils.StringUtils;
-import org.opensearch.ml.engine.function_calling.FunctionCalling;
-import org.opensearch.ml.engine.function_calling.FunctionCallingFactory;
 import org.opensearch.ml.engine.memory.ConversationIndexMemory;
 import org.opensearch.transport.client.Client;
 
@@ -73,6 +74,7 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
     private static final String DEFAULT_DEEP_RESEARCH_SYSTEM_PROMPT = "Always respond in JSON format.";
     private static final String DEFAULT_REACT_SYSTEM_PROMPT = "You are a helpful assistant.";
     private static final String DEFAULT_NO_ESCAPE_PARAMS = "tool_configs,_tools";
+    private static final String DEFAULT_MAX_STEPS_EXECUTED = "20";
 
     // fields
     public static final String PROMPT_FIELD = "prompt";
@@ -94,6 +96,7 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
     public static final String REACT_AGENT_MEMORY_ID_FIELD = "reAct_agent_memory_id";
     public static final String NO_ESCAPE_PARAMS_FIELD = "no_escape_params";
     public static final String DEFAULT_PROMPT_TOOLS_FIELD = "tools_prompt";
+    public static final String MAX_STEPS_EXECUTED_FIELD = "max_steps";
 
     public MLDeepResearchAgentRunner(
         Client client,
@@ -126,8 +129,20 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         params.put(REVAL_PROMPT_FIELD, DEEP_RESEARCH_REVALUATION_PROMPT);
         params.put(DEEP_RESEARCH_RESPONSE_FORMAT_FIELD, DEEP_RESEARCH_RESPONSE_FORMAT);
 
-        // empty by default, will be populated if model doesn't support function calling
-        params.put(DEFAULT_PROMPT_TOOLS_FIELD, "");
+        params.put(NO_ESCAPE_PARAMS_FIELD, DEFAULT_NO_ESCAPE_PARAMS);
+
+        // setting defaults for llm response
+        if (params.containsKey(LLM_INTERFACE) && (!params.containsKey(LLM_RESPONSE_FILTER) || params.get(LLM_RESPONSE_FILTER).isEmpty())) {
+            String llmInterface = params.get(LLM_INTERFACE);
+            String llmResponseFilter = switch (llmInterface.trim().toLowerCase(Locale.ROOT)) {
+                case LLM_INTERFACE_BEDROCK_CONVERSE_CLAUDE, LLM_INTERFACE_BEDROCK_CONVERSE_DEEPSEEK_R1 ->
+                    "$.output.message.content[0].text";
+                case LLM_INTERFACE_OPENAI_V1_CHAT_COMPLETIONS -> "$.choices[0].message.content";
+                default -> throw new MLException(String.format("Unsupported llm interface: %s", llmInterface));
+            };
+
+            params.put(LLM_RESPONSE_FILTER, llmResponseFilter);
+        }
     }
 
     private void usePlannerPromptTemplate(Map<String, String> params) {
@@ -153,25 +168,6 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         log.info("Prompt used: {}", prompt);
     }
 
-    // todo: handle default behavior without function calling
-    private void setupToolsInterface(Map<String, String> params) {
-        FunctionCallingFactory factory = new FunctionCallingFactory();
-        if (!params.containsKey(LLM_INTERFACE) || params.get(LLM_INTERFACE).isEmpty()) {
-            // default behavior - add to prompt
-            return;
-        }
-
-        try {
-            FunctionCalling functionCalling = factory.create(params.get(LLM_INTERFACE));
-            functionCalling.configure(params);
-            params.put(NO_ESCAPE_PARAMS_FIELD, DEFAULT_NO_ESCAPE_PARAMS);
-        } catch (MLException e) {
-            // adds tools to prompt if tool interface is invalid
-            log.error("Invalid tool interface: {}", params.get(LLM_INTERFACE));
-            params.remove(LLM_INTERFACE);
-        }
-    }
-
     @Override
     public void run(MLAgent mlAgent, Map<String, String> apiParams, ActionListener<Object> listener) {
         Map<String, String> allParams = new HashMap<>();
@@ -179,7 +175,6 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         allParams.putAll(mlAgent.getParameters());
 
         setupPromptParameters(allParams);
-        setupToolsInterface(allParams);
 
         // planner prompt for the first call
         usePlannerPromptTemplate(allParams);
@@ -212,7 +207,7 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
                         usePlannerWithHistoryPromptTemplate(allParams);
                     }
 
-                    runAgent(mlAgent, allParams, completedSteps, memory, memory.getConversationId(), listener);
+                    setToolsAndRunAgent(mlAgent, allParams, completedSteps, memory, memory.getConversationId(), listener);
                 }, e -> {
                     log.error("Failed to get chat history", e);
                     listener.onFailure(e);
@@ -220,7 +215,7 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
             }, listener::onFailure));
     }
 
-    private void runAgent(
+    private void setToolsAndRunAgent(
         MLAgent mlAgent,
         Map<String, String> allParams,
         List<String> completedSteps,
@@ -233,9 +228,12 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         Map<String, Tool> tools = new HashMap<>();
         Map<String, MLToolSpec> toolSpecMap = new HashMap<>();
         createTools(toolFactories, allParams, toolSpecs, tools, toolSpecMap, mlAgent);
-        populateTools(tools, getToolNames(tools), allParams);
+        addToolsToPrompt(tools, allParams);
 
-        executePlanningLoop(mlAgent.getLlm(), allParams, completedSteps, memory, conversationId, finalListener);
+        // todo: do these have to be passed from upstairs, since we are using this loop
+        AtomicInteger traceNumber = new AtomicInteger(0);
+
+        executePlanningLoop(mlAgent.getLlm(), allParams, completedSteps, memory, conversationId, 0, traceNumber, finalListener);
     }
 
     private void executePlanningLoop(
@@ -244,11 +242,34 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         List<String> completedSteps,
         Memory memory,
         String conversationId,
+        int stepsExecuted,
+        AtomicInteger traceNumber,
         ActionListener<Object> finalListener
     ) {
-
-        AtomicInteger traceNumber = new AtomicInteger(0);
+        int maxSteps = Integer.parseInt(allParams.getOrDefault(MAX_STEPS_EXECUTED_FIELD, DEFAULT_MAX_STEPS_EXECUTED));
         String parentInteractionId = allParams.get(MLAgentExecutor.PARENT_INTERACTION_ID);
+
+        // completedSteps stores the step and its result, hence divide by 2 to find total steps completed
+        // on reaching max iteration, update parent interaction question with last executed step rather than task to allow continue using
+        // memory_id
+        if (stepsExecuted >= maxSteps) {
+            String finalResult = String
+                .format(
+                    "Max Steps Limit Reached. Use memory_id with same task to restart. \n "
+                        + "Last executed step: %s, \n "
+                        + "Last executed step result: %s",
+                    completedSteps.get(completedSteps.size() - 2),
+                    completedSteps.getLast()
+                );
+            saveAndReturnFinalResult(
+                (ConversationIndexMemory) memory,
+                parentInteractionId,
+                finalResult,
+                completedSteps.get(completedSteps.size() - 2),
+                finalListener
+            );
+            return;
+        }
 
         MLPredictionTaskRequest request = new MLPredictionTaskRequest(
             llm.getModelId(),
@@ -269,7 +290,7 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
 
             if (parseLLMOutput.get(RESULT_FIELD) != null) {
                 String finalResult = parseLLMOutput.get(RESULT_FIELD);
-                saveAndReturnFinalResult((ConversationIndexMemory) memory, parentInteractionId, finalResult, finalListener);
+                saveAndReturnFinalResult((ConversationIndexMemory) memory, parentInteractionId, finalResult, null, finalListener);
             } else {
                 // todo: optimize double conversion of steps (string to list to string)
                 List<String> steps = Arrays.stream(parseLLMOutput.get(STEPS_FIELD).split(", ")).toList();
@@ -342,7 +363,16 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
 
                     useRevalPromptTemplate(allParams);
 
-                    executePlanningLoop(llm, allParams, completedSteps, memory, conversationId, finalListener);
+                    executePlanningLoop(
+                        llm,
+                        allParams,
+                        completedSteps,
+                        memory,
+                        conversationId,
+                        stepsExecuted + 1,
+                        traceNumber,
+                        finalListener
+                    );
                 }, e -> {
                     log.error("Failed to execute ReAct agent", e);
                     finalListener.onFailure(e);
@@ -416,16 +446,6 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         return response;
     }
 
-    // todo: handle population for default
-    private void populateTools(Map<String, Tool> tools, List<String> inputTools, Map<String, String> allParams) {
-        if (allParams.containsKey(LLM_INTERFACE) && !allParams.get(LLM_INTERFACE).isEmpty()) {
-            addToolsToFunctionCalling(tools, allParams, inputTools, "");
-            return;
-        }
-
-        addToolsToPrompt(tools, allParams);
-    }
-
     private void addToolsToPrompt(Map<String, Tool> tools, Map<String, String> allParams) {
         StringBuilder toolsPrompt = new StringBuilder("In this environment, you have access to the below tools: \n");
         for (Map.Entry<String, Tool> entry : tools.entrySet()) {
@@ -446,27 +466,32 @@ public class MLDeepResearchAgentRunner implements MLAgentRunner {
         ConversationIndexMemory memory,
         String parentInteractionId,
         String finalResult,
+        String input,
         ActionListener<Object> finalListener
     ) {
-        memory
-            .getMemoryManager()
-            .updateInteraction(parentInteractionId, Map.of(AI_RESPONSE_FIELD, finalResult), ActionListener.wrap(res -> {
-                List<ModelTensors> finalModelTensors = createModelTensors(memory.getConversationId(), parentInteractionId);
-                finalModelTensors
-                    .add(
-                        ModelTensors
-                            .builder()
-                            .mlModelTensors(
-                                List.of(ModelTensor.builder().name(RESPONSE_FIELD).dataAsMap(Map.of(RESPONSE_FIELD, finalResult)).build())
-                            )
-                            .build()
-                    );
+        Map<String, Object> updateContent = new HashMap<>();
+        updateContent.put(INTERACTIONS_RESPONSE_FIELD, finalResult);
 
-                finalListener.onResponse(ModelTensorOutput.builder().mlModelOutputs(finalModelTensors).build());
-            }, e -> {
-                log.error("Failed to update interaction with final result", e);
-                finalListener.onFailure(e);
-            }));
+        if (input != null) {
+            updateContent.put(INTERACTIONS_INPUT_FIELD, input);
+        }
+
+        memory.getMemoryManager().updateInteraction(parentInteractionId, updateContent, ActionListener.wrap(res -> {
+            List<ModelTensors> finalModelTensors = createModelTensors(memory.getConversationId(), parentInteractionId);
+            finalModelTensors
+                .add(
+                    ModelTensors
+                        .builder()
+                        .mlModelTensors(
+                            List.of(ModelTensor.builder().name(RESPONSE_FIELD).dataAsMap(Map.of(RESPONSE_FIELD, finalResult)).build())
+                        )
+                        .build()
+                );
+            finalListener.onResponse(ModelTensorOutput.builder().mlModelOutputs(finalModelTensors).build());
+        }, e -> {
+            log.error("Failed to update interaction with final result", e);
+            finalListener.onFailure(e);
+        }));
     }
 
     // Add helper method from MLChatAgentRunner
