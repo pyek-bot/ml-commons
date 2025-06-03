@@ -19,6 +19,7 @@ import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.cleanUpResour
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.createTools;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getMcpToolSpecs;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getMlToolSpecs;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.isTaskMarkedForCancel;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.LLM_INTERFACE;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.MAX_ITERATION;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.saveTraceData;
@@ -35,6 +36,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -401,6 +403,13 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
 
                 MLExecuteTaskRequest executeRequest = new MLExecuteTaskRequest(FunctionName.AGENT, agentInput);
 
+                // check if task has been marked to cancel
+                String taskId = allParams.get(TASK_ID_FIELD);
+                if (isTaskMarkedForCancel(taskId, client)) {
+                    finalListener.onFailure(new CancellationException(String.format("Agent execution cancelled for task: %s", taskId)));
+                    return;
+                }
+
                 client.execute(MLExecuteTaskAction.INSTANCE, executeRequest, ActionListener.wrap(executeResponse -> {
                     ModelTensorOutput reactResult = (ModelTensorOutput) executeResponse.getOutput();
 
@@ -449,7 +458,6 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                             .put(EXECUTOR_AGENT_PARENT_INTERACTION_ID_FIELD, allParams.get(EXECUTOR_AGENT_PARENT_INTERACTION_ID_FIELD));
                     }
 
-                    String taskId = allParams.get(TASK_ID_FIELD);
                     if (taskId != null && !taskUpdated) {
                         Map<String, Object> finalUpdate = new HashMap<>();
                         finalUpdate.put(STATE_FIELD, MLTaskState.RUNNING);
