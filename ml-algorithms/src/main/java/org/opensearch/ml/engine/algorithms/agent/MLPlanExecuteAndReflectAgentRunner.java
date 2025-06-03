@@ -35,6 +35,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -64,6 +65,9 @@ import org.opensearch.ml.common.transport.execute.MLExecuteTaskAction;
 import org.opensearch.ml.common.transport.execute.MLExecuteTaskRequest;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskAction;
 import org.opensearch.ml.common.transport.prediction.MLPredictionTaskRequest;
+import org.opensearch.ml.common.transport.task.MLTaskGetAction;
+import org.opensearch.ml.common.transport.task.MLTaskGetRequest;
+import org.opensearch.ml.common.transport.task.MLTaskGetResponse;
 import org.opensearch.ml.common.utils.StringUtils;
 import org.opensearch.ml.engine.encryptor.Encryptor;
 import org.opensearch.ml.engine.memory.ConversationIndexMemory;
@@ -407,6 +411,17 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
 
                 MLExecuteTaskRequest executeRequest = new MLExecuteTaskRequest(FunctionName.AGENT, agentInput);
 
+                // check if task has been marked to cancel
+                String taskId = allParams.get(TASK_ID_FIELD);
+                if (taskId != null && !taskId.isEmpty()) {
+                    MLTaskGetRequest taskGetRequest = MLTaskGetRequest.builder().taskId(taskId).build();
+                    MLTaskGetResponse taskResponse = client.execute(MLTaskGetAction.INSTANCE, taskGetRequest).actionGet();
+                    if (taskResponse.getMlTask().getState().equals(MLTaskState.CANCELLING)) {
+                        finalListener.onFailure(new CancellationException(String.format("Agent execution cancelled for task: %s", taskId)));
+                        return;
+                    }
+                }
+
                 client.execute(MLExecuteTaskAction.INSTANCE, executeRequest, ActionListener.wrap(executeResponse -> {
                     ModelTensorOutput reactResult = (ModelTensorOutput) executeResponse.getOutput();
 
@@ -455,7 +470,6 @@ public class MLPlanExecuteAndReflectAgentRunner implements MLAgentRunner {
                             .put(EXECUTOR_AGENT_PARENT_INTERACTION_ID_FIELD, allParams.get(EXECUTOR_AGENT_PARENT_INTERACTION_ID_FIELD));
                     }
 
-                    String taskId = allParams.get(TASK_ID_FIELD);
                     if (taskId != null && !taskUpdated) {
                         Map<String, Object> finalUpdate = new HashMap<>();
                         finalUpdate.put(STATE_FIELD, MLTaskState.RUNNING);
