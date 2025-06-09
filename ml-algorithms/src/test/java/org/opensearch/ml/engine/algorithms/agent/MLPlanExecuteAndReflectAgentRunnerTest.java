@@ -24,6 +24,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 
 import org.junit.Before;
 import org.junit.Test;
@@ -61,6 +62,12 @@ import org.opensearch.remote.metadata.client.SdkClient;
 import org.opensearch.transport.client.Client;
 
 import com.google.common.collect.ImmutableMap;
+import org.opensearch.ml.common.MLTask;
+import org.opensearch.ml.common.MLTaskState;
+import org.opensearch.ml.common.transport.task.MLTaskGetAction;
+import org.opensearch.ml.common.transport.task.MLTaskGetRequest;
+import org.opensearch.ml.common.transport.task.MLTaskGetResponse;
+import org.opensearch.common.action.ActionFuture;
 
 public class MLPlanExecuteAndReflectAgentRunnerTest {
     public static final String FIRST_TOOL = "firstTool";
