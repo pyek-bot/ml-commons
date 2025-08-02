@@ -254,6 +254,8 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
                                         if (memorySpec != null
                                             && memorySpec.getType() != null
                                             && memoryFactoryMap.containsKey(MLMemoryType.from(memorySpec.getType()).name())
+                                            && memoryFactoryMap != null
+                                            && !memoryFactoryMap.isEmpty()
                                             && (memoryId == null || parentInteractionId == null)) {
                                             Memory.Factory<Memory<?, ?, ?>> memoryFactory = memoryFactoryMap
                                                 .get(MLMemoryType.from(memorySpec.getType()).name());
