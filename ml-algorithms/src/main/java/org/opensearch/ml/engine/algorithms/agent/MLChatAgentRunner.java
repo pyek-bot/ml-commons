@@ -26,6 +26,7 @@ import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.cleanUpResour
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.constructToolParams;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.createMemoryParams;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.createTools;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.extractContentBlocksFromParameters;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getCurrentDateTime;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getMcpToolSpecs;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.getMessageHistoryLimit;
@@ -37,6 +38,7 @@ import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.substitute;
 import static org.opensearch.ml.engine.algorithms.agent.PromptTemplate.CHAT_HISTORY_PREFIX;
 import static org.opensearch.ml.engine.tools.ReadFromScratchPadTool.SCRATCHPAD_NOTES_KEY;
 
+import java.lang.reflect.Type;
 import java.security.PrivilegedActionException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -44,12 +46,15 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
+import com.google.gson.reflect.TypeToken;
+import org.apache.commons.text.StringEscapeUtils;
 import org.apache.commons.text.StringSubstitutor;
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.StepListener;
@@ -59,6 +64,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.ml.common.MLMemoryType;
+import org.opensearch.ml.common.agent.ContentBlock;
 import org.opensearch.ml.common.agent.LLMSpec;
 import org.opensearch.ml.common.agent.MLAgent;
 import org.opensearch.ml.common.agent.MLToolSpec;
@@ -77,13 +83,13 @@ import org.opensearch.ml.engine.function_calling.FunctionCallingFactory;
 import org.opensearch.ml.engine.function_calling.LLMMessage;
 import org.opensearch.ml.engine.memory.ConversationIndexMessage;
 import org.opensearch.ml.engine.tools.MLModelTool;
-import org.opensearch.ml.repackage.com.google.common.collect.ImmutableMap;
-import org.opensearch.ml.repackage.com.google.common.collect.Lists;
 import org.opensearch.remote.metadata.client.SdkClient;
 import org.opensearch.transport.TransportChannel;
 import org.opensearch.transport.client.Client;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.Lists;
 
 import lombok.Data;
 import lombok.NoArgsConstructor;
@@ -118,6 +124,7 @@ public class MLChatAgentRunner implements MLAgentRunner {
     public static final String INTERACTION_TEMPLATE_TOOL_RESPONSE = "interaction_template.tool_response";
     public static final String CHAT_HISTORY_QUESTION_TEMPLATE = "chat_history_template.user_question";
     public static final String CHAT_HISTORY_RESPONSE_TEMPLATE = "chat_history_template.ai_response";
+    public static final String CHAT_HISTORY_MULTIMODAL_QUESTION_TEMPLATE = "chat_history_multimodal_question_template";
     public static final String CHAT_HISTORY_MESSAGE_PREFIX = "${_chat_history.message.";
     public static final String LLM_INTERFACE = "_llm_interface";
     public static final String INJECT_DATETIME_FIELD = "inject_datetime";
@@ -193,26 +200,20 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Map<String, Object> memoryParams = createMemoryParams(title, memoryId, appType, mlAgent);
         memoryFactory.create(memoryParams, ActionListener.wrap(memory -> {
             // TODO: call runAgent directly if messageHistoryLimit == 0
-            memory.getMessages(messageHistoryLimit, ActionListener.<List<Interaction>>wrap(r -> {
+            memory.getMessages(messageHistoryLimit, ActionListener.wrap((List<Interaction> r) -> {
                 List<Message> messageList = new ArrayList<>();
                 for (Interaction next : r) {
-                    String question = next.getInput();
                     String response = next.getResponse();
                     // As we store the conversation with empty response first and then update when have final answer,
                     // filter out those in-flight requests when run in parallel
                     if (Strings.isNullOrEmpty(response)) {
                         continue;
                     }
-                    messageList
-                        .add(
-                            ConversationIndexMessage
-                                .conversationIndexMessageBuilder()
-                                .sessionId(memory.getId())
-                                .question(question)
-                                .response(response)
-                                .build()
-                        );
+                    // Keep the original Interaction object to preserve additionalInfo with content
+                    // blocks
+                    messageList.add(next);
                 }
+
                 if (!messageList.isEmpty()) {
                     if (chatHistoryQuestionTemplate == null) {
                         StringBuilder chatHistoryBuilder = new StringBuilder();
@@ -227,15 +228,65 @@ public class MLChatAgentRunner implements MLAgentRunner {
                     } else {
                         List<String> chatHistory = new ArrayList<>();
                         for (Message message : messageList) {
+                            // Since we now preserve Interaction objects, we can safely cast
+                            Interaction interaction = (Interaction) message;
                             Map<String, String> messageParams = new HashMap<>();
-                            messageParams.put("question", processTextDoc(((ConversationIndexMessage) message).getQuestion()));
+                            messageParams.put("question", processTextDoc(interaction.getInput()));
+                            // Check if multi-modal content blocks are available in additionalInfo
+                            String contentBlocksJson = null;
+                            if (interaction.getAdditionalInfo() != null) {
+                                contentBlocksJson = interaction.getAdditionalInfo().get("input_content_blocks");
+                            }
+
+                            // Determine which question template to use based on content availability
+                            boolean hasContentBlocks = (contentBlocksJson != null && !contentBlocksJson.isEmpty());
+                            String multimodalQuestionTemplate = params.get(CHAT_HISTORY_MULTIMODAL_QUESTION_TEMPLATE);
+                            boolean hasMultimodalQuestionTemplate = (multimodalQuestionTemplate != null);
+
+                            String questionTemplate = chatHistoryQuestionTemplate;
+                            if (hasContentBlocks && hasMultimodalQuestionTemplate) {
+                                // Use multi-modal question template when content blocks are available and
+                                // template exists
+                                questionTemplate = multimodalQuestionTemplate;
+
+                                try {
+                                    // Parse content blocks from JSON
+                                    Type listType = new TypeToken<List<ContentBlock>>() {}.getType();
+                                    List<ContentBlock> contentBlocks = gson.fromJson(contentBlocksJson, listType);
+                                    // Convert content blocks to Bedrock Converse format
+                                    String contentBlocksForTemplate = convertContentBlocksToBedrockFormat(contentBlocks);
+                                    // Fallback to text-only if conversion fails
+                                    messageParams
+                                        .put(
+                                            "content_blocks",
+                                            Objects
+                                                .requireNonNullElseGet(
+                                                    contentBlocksForTemplate,
+                                                    () -> "[{\"text\":\""
+                                                        + StringEscapeUtils.escapeJson(processTextDoc(interaction.getInput()))
+                                                        + "\"}]"
+                                                )
+                                        );
+                                } catch (Exception e) {
+                                    log.warn("Failed to parse content blocks from chat history, falling back to text", e);
+                                    // Fallback to text-only content block
+                                    messageParams
+                                        .put(
+                                            "content_blocks",
+                                            "[{\"text\":\"" + StringEscapeUtils.escapeJson(processTextDoc(interaction.getInput())) + "\"}]"
+                                        );
+                                }
+                            } else {
+                                // Use regular text-only templates
+                                messageParams.put("question", processTextDoc(interaction.getInput()));
+                            }
 
                             StringSubstitutor substitutor = new StringSubstitutor(messageParams, CHAT_HISTORY_MESSAGE_PREFIX, "}");
-                            String chatQuestionMessage = substitutor.replace(chatHistoryQuestionTemplate);
+                            String chatQuestionMessage = substitutor.replace(questionTemplate);
                             chatHistory.add(chatQuestionMessage);
 
                             messageParams.clear();
-                            messageParams.put("response", processTextDoc(((ConversationIndexMessage) message).getResponse()));
+                            messageParams.put("response", processTextDoc(interaction.getResponse()));
                             substitutor = new StringSubstitutor(messageParams, CHAT_HISTORY_MESSAGE_PREFIX, "}");
                             String chatResponseMessage = substitutor.replace(chatHistoryResponseTemplate);
                             chatHistory.add(chatResponseMessage);
@@ -243,7 +294,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                         params.put(CHAT_HISTORY, String.join(", ", chatHistory) + ", ");
                         params.put(NEW_CHAT_HISTORY, String.join(", ", chatHistory) + ", ");
 
-                        // required for MLChatAgentRunnerTest.java, it requires chatHistory to be added to input params to validate
+                        // required for MLChatAgentRunnerTest.java, it requires chatHistory to be added
+                        // to input params to validate
                         inputParams.put(CHAT_HISTORY, String.join(", ", chatHistory) + ", ");
                     }
                 }
@@ -304,6 +356,9 @@ public class MLChatAgentRunner implements MLAgentRunner {
         String parentInteractionId = tmpParameters.get(MLAgentExecutor.PARENT_INTERACTION_ID);
         boolean verbose = Boolean.parseBoolean(tmpParameters.getOrDefault(VERBOSE, "false"));
         boolean traceDisabled = tmpParameters.containsKey(DISABLE_TRACE) && Boolean.parseBoolean(tmpParameters.get(DISABLE_TRACE));
+
+        // Extract content blocks for multi-modal memory storage
+        final List<ContentBlock> inputContentBlocks = extractContentBlocksFromParameters(tmpParameters);
 
         // Create root interaction.
         // Trace number
@@ -369,7 +424,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                             memory,
                             traceNumber,
                             additionalInfo,
-                            finalAnswer
+                            finalAnswer,
+                            inputContentBlocks
                         );
                         cleanUpResource(tools);
                         return;
@@ -398,7 +454,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                         traceDisabled,
                         parentInteractionId,
                         traceNumber,
-                        "LLM"
+                        "LLM",
+                        inputContentBlocks
                     );
 
                     if (nextStepListener == null) {
@@ -415,7 +472,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                             additionalInfo,
                             lastThought,
                             maxIterations,
-                            tools
+                            tools,
+                            inputContentBlocks
                         );
                         return;
                     }
@@ -477,7 +535,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                         traceDisabled,
                         parentInteractionId,
                         traceNumber,
-                        lastAction.get()
+                        lastAction.get(),
+                        inputContentBlocks
                     );
 
                     StringSubstitutor substitutor = new StringSubstitutor(Map.of(SCRATCHPAD, scratchpadBuilder), "${parameters.", "}");
@@ -516,7 +575,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
                             additionalInfo,
                             lastThought,
                             maxIterations,
-                            tools
+                            tools,
+                            inputContentBlocks
                         );
                         return;
                     }
@@ -681,6 +741,82 @@ public class MLChatAgentRunner implements MLAgentRunner {
         }
     }
 
+    // Todo: can we use bedrock converse model provider for the same
+    /**
+     * Converts content blocks to Bedrock Converse API format for chat history.
+     * This reuses the same conversion logic as BedrockConverseModelProvider.
+     */
+    private static String convertContentBlocksToBedrockFormat(List<org.opensearch.ml.common.agent.ContentBlock> contentBlocks) {
+        if (contentBlocks == null || contentBlocks.isEmpty()) {
+            return null;
+        }
+
+        StringBuilder contentArray = new StringBuilder();
+        boolean first = true;
+        for (org.opensearch.ml.common.agent.ContentBlock block : contentBlocks) {
+            if (!first) {
+                contentArray.append(",");
+            }
+            first = false;
+
+            switch (block.getType()) {
+                case TEXT:
+                    contentArray.append("{\"text\":\"").append(StringEscapeUtils.escapeJson(block.getText())).append("\"}");
+                    break;
+                case IMAGE:
+                    if (block.getImage() != null) {
+                        String sourceType = block.getImage().getType() == org.opensearch.ml.common.agent.SourceType.URL
+                            ? "s3Location"
+                            : "bytes";
+                        contentArray
+                            .append("{\"image\":{\"format\":\"")
+                            .append(block.getImage().getFormat())
+                            .append("\",\"source\":{\"")
+                            .append(sourceType)
+                            .append("\":\"")
+                            .append(block.getImage().getData())
+                            .append("\"}}}");
+                    }
+                    break;
+                case VIDEO:
+                    if (block.getVideo() != null) {
+                        String sourceType = block.getVideo().getType() == org.opensearch.ml.common.agent.SourceType.URL
+                            ? "s3Location"
+                            : "bytes";
+                        contentArray
+                            .append("{\"video\":{\"format\":\"")
+                            .append(block.getVideo().getFormat())
+                            .append("\",\"source\":{\"")
+                            .append(sourceType)
+                            .append("\":\"")
+                            .append(block.getVideo().getData())
+                            .append("\"}}}");
+                    }
+                    break;
+                case DOCUMENT:
+                    if (block.getDocument() != null) {
+                        String sourceType = block.getDocument().getType() == org.opensearch.ml.common.agent.SourceType.URL
+                            ? "s3Location"
+                            : "bytes";
+                        contentArray
+                            .append("{\"document\":{\"format\":\"")
+                            .append(block.getDocument().getFormat())
+                            .append("\",\"name\":\"document\",\"source\":{\"")
+                            .append(sourceType)
+                            .append("\":\"")
+                            .append(block.getDocument().getData())
+                            .append("\"}}}");
+                    }
+                    break;
+                default:
+                    // Skip unsupported content types
+                    break;
+            }
+        }
+
+        return "[" + contentArray.toString() + "]";
+    }
+
     public static void saveTraceData(
         Memory memory,
         String memoryType,
@@ -707,6 +843,50 @@ public class MLChatAgentRunner implements MLAgentRunner {
         }
     }
 
+    /**
+     * Enhanced saveTraceData method that supports multi-modal input content.
+     * This method accepts input content blocks for storing rich media in memory.
+     */
+    public static void saveTraceData(
+        Memory memory,
+        String memoryType,
+        String question,
+        String thoughtResponse,
+        String sessionId,
+        boolean traceDisabled,
+        String parentInteractionId,
+        AtomicInteger traceNumber,
+        String origin,
+        List<org.opensearch.ml.common.agent.ContentBlock> inputContentBlocks
+    ) {
+        if (memory != null) {
+            ConversationIndexMessage msgTemp;
+            if (inputContentBlocks != null && !inputContentBlocks.isEmpty()) {
+                msgTemp = ConversationIndexMessage
+                    .conversationIndexMessageBuilderWithContent()
+                    .type(memoryType)
+                    .question(question)
+                    .response(thoughtResponse)
+                    .finalAnswer(false)
+                    .sessionId(sessionId)
+                    .inputContentBlocks(inputContentBlocks)
+                    .build();
+            } else {
+                msgTemp = ConversationIndexMessage
+                    .conversationIndexMessageBuilder()
+                    .type(memoryType)
+                    .question(question)
+                    .response(thoughtResponse)
+                    .finalAnswer(false)
+                    .sessionId(sessionId)
+                    .build();
+            }
+            if (!traceDisabled) {
+                memory.save(msgTemp, parentInteractionId, traceNumber.addAndGet(1), origin);
+            }
+        }
+    }
+
     private void sendFinalAnswer(
         String sessionId,
         ActionListener<Object> listener,
@@ -718,7 +898,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Memory memory,
         AtomicInteger traceNumber,
         Map<String, Object> additionalInfo,
-        String finalAnswer
+        String finalAnswer,
+        List<ContentBlock> inputContentBlocks
     ) {
         // Send completion chunk for streaming
         streamingWrapper.sendCompletionChunk(sessionId, parentInteractionId);
@@ -743,7 +924,34 @@ public class MLChatAgentRunner implements MLAgentRunner {
                         }, e -> { listener.onFailure(e); })
                     );
             }, e -> { listener.onFailure(e); });
-            saveMessage(memory, question, finalAnswer, sessionId, parentInteractionId, traceNumber, true, traceDisabled, saveTraceListener);
+
+            // todo: overload this method
+            if (inputContentBlocks != null && !inputContentBlocks.isEmpty()) {
+                saveMessageWithContent(
+                    memory,
+                    question,
+                    finalAnswer,
+                    sessionId,
+                    parentInteractionId,
+                    traceNumber,
+                    true,
+                    traceDisabled,
+                    saveTraceListener,
+                    inputContentBlocks
+                );
+            } else {
+                saveMessage(
+                    memory,
+                    question,
+                    finalAnswer,
+                    sessionId,
+                    parentInteractionId,
+                    traceNumber,
+                    true,
+                    traceDisabled,
+                    saveTraceListener
+                );
+            }
         } else {
             streamingWrapper
                 .sendFinalResponse(sessionId, listener, parentInteractionId, verbose, cotModelTensors, additionalInfo, finalAnswer);
@@ -891,7 +1099,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
         Map<String, Object> additionalInfo,
         AtomicReference<String> lastThought,
         int maxIterations,
-        Map<String, Tool> tools
+        Map<String, Tool> tools,
+        List<ContentBlock> inputContentBlocks
     ) {
         String incompleteResponse = (lastThought.get() != null && !lastThought.get().isEmpty() && !"null".equals(lastThought.get()))
             ? String.format("%s. Last thought: %s", String.format(MAX_ITERATIONS_MESSAGE, maxIterations), lastThought.get())
@@ -907,7 +1116,8 @@ public class MLChatAgentRunner implements MLAgentRunner {
             memory,
             traceNumber,
             additionalInfo,
-            incompleteResponse
+            incompleteResponse,
+            inputContentBlocks
         );
         cleanUpResource(tools);
     }
@@ -930,6 +1140,38 @@ public class MLChatAgentRunner implements MLAgentRunner {
             .response(finalAnswer)
             .finalAnswer(isFinalAnswer)
             .sessionId(sessionId)
+            .build();
+        if (traceDisabled) {
+            listener.onResponse(true);
+        } else {
+            memory.save(msgTemp, parentInteractionId, traceNumber.addAndGet(1), "LLM", listener);
+        }
+    }
+
+    /**
+     * Enhanced saveMessage method that supports multi-modal input content.
+     * This method accepts input content blocks for storing rich media in memory.
+     */
+    private void saveMessageWithContent(
+        Memory memory,
+        String question,
+        String finalAnswer,
+        String sessionId,
+        String parentInteractionId,
+        AtomicInteger traceNumber,
+        boolean isFinalAnswer,
+        boolean traceDisabled,
+        ActionListener listener,
+        List<org.opensearch.ml.common.agent.ContentBlock> inputContentBlocks
+    ) {
+        ConversationIndexMessage msgTemp = ConversationIndexMessage
+            .conversationIndexMessageBuilderWithContent()
+            .type(memory.getType())
+            .question(question)
+            .response(finalAnswer)
+            .finalAnswer(isFinalAnswer)
+            .sessionId(sessionId)
+            .inputContentBlocks(inputContentBlocks)
             .build();
         if (traceDisabled) {
             listener.onResponse(true);

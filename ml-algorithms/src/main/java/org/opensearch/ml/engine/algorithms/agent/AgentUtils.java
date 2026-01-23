@@ -71,11 +71,13 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.ml.common.agent.ContentBlock;
 import org.opensearch.ml.common.agent.MLAgent;
 import org.opensearch.ml.common.agent.MLToolSpec;
 import org.opensearch.ml.common.connector.Connector;
 import org.opensearch.ml.common.connector.McpConnector;
 import org.opensearch.ml.common.connector.McpStreamableHttpConnector;
+import org.opensearch.ml.common.exception.MLException;
 import org.opensearch.ml.common.output.model.ModelTensor;
 import org.opensearch.ml.common.output.model.ModelTensorOutput;
 import org.opensearch.ml.common.spi.tools.Tool;
@@ -146,6 +148,8 @@ public class AgentUtils {
     public static final String DEFAULT_DATETIME_FORMAT = "yyyy-MM-dd'T'HH:mm:ss'Z'";
     public static final String DEFAULT_DATETIME_PREFIX = "Current date and time: ";
     private static final ZoneId UTC_ZONE = ZoneId.of("UTC");
+
+    public static final String CONTENT_BLOCKS = "content_blocks";
 
     public static String addExamplesToPrompt(Map<String, String> parameters, String prompt) {
         Map<String, String> examplesMap = new HashMap<>();
@@ -1027,5 +1031,24 @@ public class AgentUtils {
             memoryParams.put(MEMORY_CONTAINER_ID_FIELD, mlAgent.getMemory().getMemoryContainerId());
         }
         return memoryParams;
+    }
+
+    /**
+     * Extracts content blocks from parameters for multi-modal memory storage.
+     * This is a helper method to handle the parsing in a way that makes the
+     * variable effectively final.
+     */
+    public static List<ContentBlock> extractContentBlocksFromParameters(Map<String, String> parameters) {
+        String contentBlocksJson = parameters.get(CONTENT_BLOCKS);
+        if (contentBlocksJson == null || contentBlocksJson.isEmpty()) {
+            return null;
+        }
+
+        try {
+            Type listType = new TypeToken<List<ContentBlock>>() {}.getType();
+            return gson.fromJson(contentBlocksJson, listType);
+        } catch (Exception e) {
+            throw new MLException("Failed to parse content blocks from parameters", e);
+        }
     }
 }

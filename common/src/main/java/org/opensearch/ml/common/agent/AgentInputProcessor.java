@@ -162,6 +162,39 @@ public class AgentInputProcessor {
     }
 
     /**
+     * Extracts content blocks from AgentInput for memory storage.
+     * This provides the full multi-modal content that will be stored in memory.
+     * For provider-agnostic memory storage of images, videos, documents, etc.
+     */
+    public static List<ContentBlock> extractContentBlocks(AgentInput agentInput) {
+        validateInput(agentInput);
+        return switch (agentInput.getInputType()) {
+            case TEXT -> {
+                // Convert text to a single text content block
+                String text = (String) agentInput.getInput();
+                ContentBlock textBlock = new ContentBlock();
+                textBlock.setType(ContentType.TEXT);
+                textBlock.setText(text);
+                yield List.of(textBlock);
+            }
+            case CONTENT_BLOCKS -> {
+                // Return content blocks directly
+                @SuppressWarnings("unchecked")
+                List<ContentBlock> blocks = (List<ContentBlock>) agentInput.getInput();
+                yield List.copyOf(blocks); // Return a copy to avoid modification
+            }
+            case MESSAGES -> {
+                // Extract content blocks from the last user message
+                @SuppressWarnings("unchecked")
+                List<Message> messages = (List<Message>) agentInput.getInput();
+                Message lastMessage = messages.getLast();
+                yield List.copyOf(lastMessage.getContent());
+            }
+            default -> throw new IllegalArgumentException("Unsupported input type: " + agentInput.getInputType());
+        };
+    }
+
+    /**
      * Extracts text content from content blocks for human-readable display.
      * Ignores non text blocks
      * @throws IllegalArgumentException if content blocks are invalid[

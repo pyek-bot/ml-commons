@@ -20,6 +20,7 @@ import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.TOOL_CALL_ID_
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.TOOL_RESULT;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.TOOL_TEMPLATE;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.removeJsonPath;
+import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.CHAT_HISTORY_MULTIMODAL_QUESTION_TEMPLATE;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.CHAT_HISTORY_QUESTION_TEMPLATE;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.CHAT_HISTORY_RESPONSE_TEMPLATE;
 import static org.opensearch.ml.engine.algorithms.agent.MLChatAgentRunner.INTERACTION_TEMPLATE_TOOL_RESPONSE;
@@ -71,6 +72,10 @@ public class BedrockConverseFunctionCalling implements FunctionCalling {
         params.put(CHAT_HISTORY_QUESTION_TEMPLATE, "{\"role\":\"user\",\"content\":[{\"text\":\"${_chat_history.message.question}\"}]}");
         params
             .put(CHAT_HISTORY_RESPONSE_TEMPLATE, "{\"role\":\"assistant\",\"content\":[{\"text\":\"${_chat_history.message.response}\"}]}");
+
+        // Add multi-modal question template for when input content blocks are available
+        // Response always uses regular text template since LLM responses are text-only
+        params.put(CHAT_HISTORY_MULTIMODAL_QUESTION_TEMPLATE, "{\"role\":\"user\",\"content\":${_chat_history.message.content_blocks}}");
 
         params.put(LLM_FINISH_REASON_PATH, "$.stopReason");
         params.put(LLM_FINISH_REASON_TOOL_USE, "tool_use");

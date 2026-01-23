@@ -5,6 +5,7 @@
 
 package org.opensearch.ml.engine.memory;
 
+import static org.opensearch.ml.common.utils.StringUtils.gson;
 import static org.opensearch.ml.engine.memory.ConversationIndexMemory.APP_TYPE;
 import static org.opensearch.ml.engine.memory.ConversationIndexMemory.MEMORY_ID;
 import static org.opensearch.ml.engine.memory.ConversationIndexMemory.MEMORY_NAME;
@@ -21,6 +22,7 @@ import org.opensearch.core.common.Strings;
 import org.opensearch.index.query.BoolQueryBuilder;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.ml.common.MLMemoryType;
+import org.opensearch.ml.common.agent.ContentBlock;
 import org.opensearch.ml.common.conversation.Interaction;
 import org.opensearch.ml.common.memory.Memory;
 import org.opensearch.ml.common.memory.Message;
@@ -51,7 +53,8 @@ import lombok.extern.log4j.Log4j2;
 
 /**
  * Agentic Memory implementation that stores conversations in Memory Container
- * Uses TransportCreateSessionAction and TransportAddMemoriesAction for all operations
+ * Uses TransportCreateSessionAction and TransportAddMemoriesAction for all
+ * operations
  */
 @Log4j2
 @Getter
@@ -124,6 +127,11 @@ public class AgenticConversationMemory implements Memory<Message, CreateInteract
         // Store data in structured_data format matching conversation index
         structuredData.put("input", msg.getQuestion() != null ? msg.getQuestion() : "");
         structuredData.put("response", msg.getResponse() != null ? msg.getResponse() : "");
+
+        // Store multi-modal input content blocks if present
+        if (msg.getInputContentBlocks() != null && !msg.getInputContentBlocks().isEmpty()) {
+            structuredData.put("input_content_blocks", serializeContentBlocks(msg.getInputContentBlocks()));
+        }
 
         if (isTrace) {
             // This is a trace (tool usage or intermediate step)
@@ -393,20 +401,35 @@ public class AgenticConversationMemory implements Memory<Message, CreateInteract
 
                 // Create Interaction object
                 if (input != null || response != null) {
-                    Interaction interaction = Interaction
-                        .builder()
-                        .id(hit.getId())
-                        .conversationId(conversationId)
-                        .createTime(createTime != null ? createTime : java.time.Instant.now())
-                        .updatedTime(updatedTime)
-                        .input(input != null ? input : "")
-                        .response(response != null ? response : "")
-                        .origin("agentic_memory")
-                        .promptTemplate(null)
-                        .additionalInfo(null)
-                        .parentInteractionId(parentInteractionId)
-                        .traceNum(null) // Messages don't have trace numbers
-                        .build();
+                    // Extract multi-modal input content blocks if present
+                    Object inputContentBlocksData = structuredData.get("input_content_blocks");
+                    List<ContentBlock> inputContentBlocks = null;
+
+                    if (inputContentBlocksData != null) {
+                        inputContentBlocks = deserializeContentBlocks(inputContentBlocksData);
+                    }
+
+                    // Create additional info map to store multi-modal content
+                    Map<String, String> additionalInfo = new HashMap<>();
+                    if (inputContentBlocks != null && !inputContentBlocks.isEmpty()) {
+                        // Serialize content blocks to JSON string for storage in additionalInfo
+                        String serializedBlocks = gson.toJson(inputContentBlocks);
+                        additionalInfo.put("input_content_blocks", serializedBlocks);
+                    }
+
+                    Interaction interaction = new Interaction(
+                        hit.getId(),
+                        createTime != null ? createTime : java.time.Instant.now(),
+                        updatedTime,
+                        conversationId,
+                        input != null ? input : "",
+                        null, // promptTemplate
+                        response != null ? response : "",
+                        "agentic_memory", // origin
+                        additionalInfo,
+                        parentInteractionId,
+                        null // traceNum - Messages don't have trace numbers
+                    );
                     interactions.add(interaction);
                 }
             }
@@ -630,5 +653,129 @@ public class AgenticConversationMemory implements Memory<Message, CreateInteract
             return ((Number) value).longValue();
         }
         return null;
+    }
+
+    /**
+     * Serializes content blocks to JSON for storage in structured_data.
+     * This allows multi-modal content to be stored in a provider-agnostic way.
+     */
+    private List<Map<String, Object>>serializeContentBlocks(List<ContentBlock> contentBlocks) {
+        if (contentBlocks == null || contentBlocks.isEmpty()) {
+            return null;
+        }
+
+        List<Map<String, Object>> serializedBlocks = new ArrayList<>();
+
+        for (ContentBlock block : contentBlocks) {
+            Map<String, Object> blockMap = new HashMap<>();
+            blockMap.put("type", block.getType().name());
+
+            switch (block.getType()) {
+                case TEXT:
+                    blockMap.put("text", block.getText());
+                    break;
+                case IMAGE:
+                    if (block.getImage() != null) {
+                        Map<String, Object> imageMap = new HashMap<>();
+                        imageMap.put("type", block.getImage().getType().name());
+                        imageMap.put("format", block.getImage().getFormat());
+                        imageMap.put("data", block.getImage().getData());
+                        blockMap.put("image", imageMap);
+                    }
+                    break;
+                case VIDEO:
+                    if (block.getVideo() != null) {
+                        Map<String, Object> videoMap = new HashMap<>();
+                        videoMap.put("type", block.getVideo().getType().name());
+                        videoMap.put("format", block.getVideo().getFormat());
+                        videoMap.put("data", block.getVideo().getData());
+                        blockMap.put("video", videoMap);
+                    }
+                    break;
+                case DOCUMENT:
+                    if (block.getDocument() != null) {
+                        Map<String, Object> docMap = new HashMap<>();
+                        docMap.put("type", block.getDocument().getType().name());
+                        docMap.put("format", block.getDocument().getFormat());
+                        docMap.put("data", block.getDocument().getData());
+                        blockMap.put("document", docMap);
+                    }
+                    break;
+            }
+            serializedBlocks.add(blockMap);
+        }
+
+        return serializedBlocks;
+    }
+
+    /**
+     * Deserializes content blocks from JSON stored in structured_data.
+     * This reconstructs multi-modal content when retrieving from memory.
+     */
+    private List<ContentBlock> deserializeContentBlocks(Object contentBlocksData) {
+        if (contentBlocksData == null) {
+            return null;
+        }
+
+        try {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> blockMaps = (List<Map<String, Object>>) contentBlocksData;
+            List<ContentBlock> contentBlocks = new ArrayList<>();
+
+            for (Map<String, Object> blockMap : blockMaps) {
+                ContentBlock block = new ContentBlock();
+                String typeStr = (String) blockMap.get("type");
+
+                if (typeStr != null) {
+                    block.setType(org.opensearch.ml.common.agent.ContentType.valueOf(typeStr));
+
+                    switch (block.getType()) {
+                        case TEXT:
+                            block.setText((String) blockMap.get("text"));
+                            break;
+                        case IMAGE:
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> imageMap = (Map<String, Object>) blockMap.get("image");
+                            if (imageMap != null) {
+                                org.opensearch.ml.common.agent.ImageContent image = new org.opensearch.ml.common.agent.ImageContent();
+                                image.setType(org.opensearch.ml.common.agent.SourceType.valueOf((String) imageMap.get("type")));
+                                image.setFormat((String) imageMap.get("format"));
+                                image.setData((String) imageMap.get("data"));
+                                block.setImage(image);
+                            }
+                            break;
+                        case VIDEO:
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> videoMap = (Map<String, Object>) blockMap.get("video");
+                            if (videoMap != null) {
+                                org.opensearch.ml.common.agent.VideoContent video = new org.opensearch.ml.common.agent.VideoContent();
+                                video.setType(org.opensearch.ml.common.agent.SourceType.valueOf((String) videoMap.get("type")));
+                                video.setFormat((String) videoMap.get("format"));
+                                video.setData((String) videoMap.get("data"));
+                                block.setVideo(video);
+                            }
+                            break;
+                        case DOCUMENT:
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> docMap = (Map<String, Object>) blockMap.get("document");
+                            if (docMap != null) {
+                                org.opensearch.ml.common.agent.DocumentContent document =
+                                    new org.opensearch.ml.common.agent.DocumentContent();
+                                document.setType(org.opensearch.ml.common.agent.SourceType.valueOf((String) docMap.get("type")));
+                                document.setFormat((String) docMap.get("format"));
+                                document.setData((String) docMap.get("data"));
+                                block.setDocument(document);
+                            }
+                            break;
+                    }
+                    contentBlocks.add(block);
+                }
+            }
+
+            return contentBlocks;
+        } catch (Exception e) {
+            log.error("\nFailed to deserialize content blocks from memory: {}", contentBlocksData, e);
+            return null;
+        }
     }
 }

@@ -16,7 +16,9 @@ import static org.opensearch.ml.common.MLTask.TASK_ID_FIELD;
 import static org.opensearch.ml.common.output.model.ModelTensorOutput.INFERENCE_RESULT_FIELD;
 import static org.opensearch.ml.common.settings.MLCommonsSettings.ML_COMMONS_MCP_CONNECTOR_DISABLED_MESSAGE;
 import static org.opensearch.ml.common.utils.MLTaskUtils.updateMLTaskDirectly;
+import static org.opensearch.ml.common.utils.StringUtils.gson;
 import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.createMemoryParams;
+import static org.opensearch.ml.engine.algorithms.agent.AgentUtils.extractContentBlocksFromParameters;
 
 import java.security.AccessController;
 import java.security.PrivilegedActionException;
@@ -53,6 +55,7 @@ import org.opensearch.ml.common.MLTaskState;
 import org.opensearch.ml.common.MLTaskType;
 import org.opensearch.ml.common.agent.AgentInput;
 import org.opensearch.ml.common.agent.AgentInputProcessor;
+import org.opensearch.ml.common.agent.ContentBlock;
 import org.opensearch.ml.common.agent.MLAgent;
 import org.opensearch.ml.common.agent.MLMemorySpec;
 import org.opensearch.ml.common.agent.ModelProvider;
@@ -102,6 +105,7 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
 
     public static final String MEMORY_ID = "memory_id";
     public static final String QUESTION = "question";
+    public static final String CONTENT_BLOCKS = "content_blocks";
     public static final String PARENT_INTERACTION_ID = "parent_interaction_id";
     public static final String REGENERATE_INTERACTION_ID = "regenerate_interaction_id";
     public static final String MESSAGE_HISTORY_LIMIT = "message_history_limit";
@@ -388,10 +392,11 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
 
     /**
      * save root interaction and start execute the agent
-     * @param listener callback listener
-     * @param memory memory instance
+     * 
+     * @param listener     callback listener
+     * @param memory       memory instance
      * @param inputDataSet input
-     * @param mlAgent agent to run
+     * @param mlAgent      agent to run
      */
     private void saveRootInteractionAndExecute(
         ActionListener<Output> listener,
@@ -407,15 +412,22 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
         String appType = mlAgent.getAppType();
         String question = inputDataSet.getParameters().get(QUESTION);
         String regenerateInteractionId = inputDataSet.getParameters().get(REGENERATE_INTERACTION_ID);
-        // Create root interaction ID
-        ConversationIndexMessage msg = ConversationIndexMessage
-            .conversationIndexMessageBuilder()
+
+        List<ContentBlock> inputContentBlocks = extractContentBlocksFromParameters(inputDataSet.getParameters());
+
+        // Create root interaction ID with content blocks if available
+        var builder = inputContentBlocks != null && !inputContentBlocks.isEmpty()
+            ? ConversationIndexMessage.conversationIndexMessageBuilderWithContent().inputContentBlocks(inputContentBlocks)
+            : ConversationIndexMessage.conversationIndexMessageBuilder();
+
+        ConversationIndexMessage msg = builder
             .type(appType)
             .question(question)
             .response("")
             .finalAnswer(true)
             .sessionId(memory.getId())
             .build();
+
         memory.save(msg, null, null, null, ActionListener.<CreateInteractionResponse>wrap(interaction -> {
             log.info("Created parent interaction ID: {}", interaction.getId());
             inputDataSet.getParameters().put(PARENT_INTERACTION_ID, interaction.getId());
@@ -738,24 +750,32 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
 
     /**
      * Processes standardized input if present in AgentMLInput.
-     * This method handles the conversion from AgentInput to parameters that can be used
+     * This method handles the conversion from AgentInput to parameters that can be
+     * used
      * by the existing agent execution logic.
      */
     private void processAgentInput(AgentMLInput agentMLInput, MLAgent mlAgent) {
+        if (mlAgent.getModel() == null) {
+            return;
+        }
+
         // If legacy question input is provided, parse to new standard input
         if (agentMLInput.getInputDataset() != null) {
             RemoteInferenceInputDataSet remoteInferenceInputDataSet = (RemoteInferenceInputDataSet) agentMLInput.getInputDataset();
-            if (!remoteInferenceInputDataSet.getParameters().containsKey(QUESTION)) {
-                throw new IllegalArgumentException("Question not found in parameters.");
+            if (remoteInferenceInputDataSet.getParameters().containsKey(QUESTION)) {
+                AgentInput standardInput = new AgentInput(remoteInferenceInputDataSet.getParameters().get(QUESTION));
+                agentMLInput.setAgentInput(standardInput);
             }
-
-            AgentInput standardInput = new AgentInput(remoteInferenceInputDataSet.getParameters().get(QUESTION));
-            agentMLInput.setAgentInput(standardInput);
         }
 
         try {
+            // todo: optimize to return both question and content block in same call
             // Extract the question text for prompt template and memory storage
             String question = AgentInputProcessor.extractQuestionText(agentMLInput.getAgentInput());
+
+            // Extract content blocks for multi-modal memory storage
+            List<ContentBlock> contentBlocks = AgentInputProcessor.extractContentBlocks(agentMLInput.getAgentInput());
+
             ModelProvider modelProvider = ModelProviderFactory.getProvider(mlAgent.getModel().getModelProvider());
 
             // create input dataset if it doesn't exist
@@ -766,8 +786,15 @@ public class MLAgentExecutor implements Executable, SettingsChangeListener {
             // Set parameters to processed params
             RemoteInferenceInputDataSet remoteDataSet = (RemoteInferenceInputDataSet) agentMLInput.getInputDataset();
             Map<String, String> parameters = modelProvider.mapAgentInput(agentMLInput.getAgentInput());
+
             // set question to questionText for memory
             parameters.put(QUESTION, question);
+
+            // Store content blocks for memory (serialize to JSON for parameter passing)
+            if (contentBlocks != null && !contentBlocks.isEmpty()) {
+                parameters.put(CONTENT_BLOCKS, gson.toJson(contentBlocks));
+            }
+
             remoteDataSet.getParameters().putAll(parameters);
         } catch (Exception e) {
             log.error("Failed to process standardized input for agent {}", mlAgent.getName(), e);
