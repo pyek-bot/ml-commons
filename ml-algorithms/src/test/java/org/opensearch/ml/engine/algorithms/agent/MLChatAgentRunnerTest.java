@@ -1660,7 +1660,7 @@ public class MLChatAgentRunnerTest {
         params.put(AgentTokenTracker.IS_SUB_AGENT_FIELD, "true");
 
         String result = MLChatAgentRunner.formatFailureMessage(params, "Tool failed");
-        assertEquals("Agent failed to complete the task. Reason: Tool failed", result);
+        assertEquals(PromptTemplate.SUB_AGENT_FAILURE_PREFIX + "Tool failed", result);
     }
 
     @Test
@@ -1679,6 +1679,15 @@ public class MLChatAgentRunnerTest {
 
         String result = MLChatAgentRunner.formatFailureMessage(params, "Tool failed");
         assertEquals("Tool failed", result);
+    }
+
+    @Test
+    public void testFormatFailureMessage_NullFailureMessage() {
+        Map<String, String> params = new HashMap<>();
+        params.put(AgentTokenTracker.IS_SUB_AGENT_FIELD, "true");
+
+        String result = MLChatAgentRunner.formatFailureMessage(params, null);
+        assertEquals(PromptTemplate.SUB_AGENT_FAILURE_PREFIX + "Unknown error", result);
     }
 
 }
