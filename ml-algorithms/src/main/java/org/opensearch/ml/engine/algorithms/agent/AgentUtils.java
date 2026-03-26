@@ -249,6 +249,13 @@ public class AgentUtils {
                     String cleanedSchema = removeAdditionalPropertiesFromSchema(schema);
                     toolParams.put("attributes.input_schema_cleaned", cleanedSchema);
                 }
+                // For Bedrock Converse, build cacheControl block if cache parameters are present
+                if (attributes.containsKey("cache_type") || attributes.containsKey("cache_ttl")) {
+                    String cacheControl = buildCacheControlBlock(attributes);
+                    if (cacheControl != null) {
+                        toolParams.put("attributes.cache_control", cacheControl);
+                    }
+                }
             }
             StringSubstitutor substitutor = new StringSubstitutor(toolParams, "${tool.", "}");
             String chatQuestionMessage = substitutor.replace(toolTemplate);
@@ -256,6 +263,42 @@ public class AgentUtils {
         }
         parameters.put(TOOLS, String.join(", ", toolInfos));
         return prompt;
+    }
+
+    /**
+     * Builds a cacheControl block for Bedrock Converse prompt caching.
+     * The cache configuration includes type (e.g., "ephemeral") and ttlSeconds.
+     *
+     * @param attributes Tool attributes containing cache_type and/or cache_ttl
+     * @return JSON string for cacheControl block, or null if cache parameters are invalid
+     */
+    private static String buildCacheControlBlock(Map<String, ?> attributes) {
+        if (attributes == null) {
+            return null;
+        }
+
+        String cacheType = String.valueOf(attributes.get("cache_type"));
+        String cacheTtl = String.valueOf(attributes.get("cache_ttl"));
+
+        // Both parameters must be present and valid
+        if ("null".equals(cacheType) || "null".equals(cacheTtl)) {
+            return null;
+        }
+
+        try {
+            // Validate TTL is a positive integer
+            int ttlSeconds = Integer.parseInt(cacheTtl);
+            if (ttlSeconds <= 0) {
+                log.warn("Invalid cache_ttl value: {}. Must be a positive integer.", cacheTtl);
+                return null;
+            }
+
+            // Build cacheControl JSON block
+            return String.format(", \"cacheControl\": {\"type\": \"%s\", \"ttlSeconds\": %d}", cacheType, ttlSeconds);
+        } catch (NumberFormatException e) {
+            log.warn("Invalid cache_ttl value: {}. Must be a valid integer.", cacheTtl);
+            return null;
+        }
     }
 
     /**

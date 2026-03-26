@@ -52,7 +52,7 @@ public class BedrockConverseFunctionCalling implements FunctionCalling {
     public static final String ID_PATH = "toolUseId";
     public static final String TOOL_ERROR = "tool_error";
     public static final String BEDROCK_CONVERSE_TOOL_TEMPLATE =
-        "{\"toolSpec\":{\"name\":\"${tool.name}\",\"description\":\"${tool.description}\",\"inputSchema\": {\"json\": ${tool.attributes.input_schema} } }}";
+        "{\"toolSpec\":{\"name\":\"${tool.name}\",\"description\":\"${tool.description}\",\"inputSchema\": {\"json\": ${tool.attributes.input_schema} }${tool.attributes.cache_control:-} }}";
 
     @Override
     public void configure(Map<String, String> params) {

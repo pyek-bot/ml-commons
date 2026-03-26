@@ -6,6 +6,7 @@
 package org.opensearch.ml.engine.algorithms.agent;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
@@ -1260,6 +1261,98 @@ public class AgentUtilsTest extends MLStaticMockBase {
         String prompt = "test prompt";
 
         assertThrows(IllegalArgumentException.class, () -> AgentUtils.addToolsToFunctionCalling(tools, parameters, inputTools, prompt));
+    }
+
+    @Test
+    public void testAddToolsToFunctionCalling_WithCacheControl() {
+        // Create tool with cache configuration
+        Map<String, Object> attributes = new HashMap<>();
+        attributes.put("input_schema", "{\"type\":\"object\"}");
+        attributes.put("cache_type", "ephemeral");
+        attributes.put("cache_ttl", "300");
+
+        Tool toolWithCache = mock(Tool.class);
+        when(toolWithCache.getName()).thenReturn("CachedTool");
+        when(toolWithCache.getDescription()).thenReturn("Tool with caching");
+        when(toolWithCache.getAttributes()).thenReturn(attributes);
+
+        Map<String, Tool> tools = new HashMap<>();
+        tools.put("CachedTool", toolWithCache);
+
+        Map<String, String> parameters = new HashMap<>();
+        // Bedrock Converse tool template with cache control placeholder
+        String toolTemplate =
+            "{\"toolSpec\":{\"name\":\"${tool.name}\",\"description\":\"${tool.description}\",\"inputSchema\":{\"json\":${tool.attributes.input_schema}}${tool.attributes.cache_control:-}}}";
+        parameters.put(TOOL_TEMPLATE, toolTemplate);
+
+        List<String> inputTools = Arrays.asList("CachedTool");
+        String prompt = "test prompt";
+
+        AgentUtils.addToolsToFunctionCalling(tools, parameters, inputTools, prompt);
+
+        String result = parameters.get(TOOLS);
+        assertTrue(result.contains("\"cacheControl\""));
+        assertTrue(result.contains("\"type\": \"ephemeral\""));
+        assertTrue(result.contains("\"ttlSeconds\": 300"));
+    }
+
+    @Test
+    public void testAddToolsToFunctionCalling_WithoutCacheControl() {
+        // Create tool without cache configuration
+        Map<String, Object> attributes = new HashMap<>();
+        attributes.put("input_schema", "{\"type\":\"object\"}");
+
+        Tool toolWithoutCache = mock(Tool.class);
+        when(toolWithoutCache.getName()).thenReturn("RegularTool");
+        when(toolWithoutCache.getDescription()).thenReturn("Tool without caching");
+        when(toolWithoutCache.getAttributes()).thenReturn(attributes);
+
+        Map<String, Tool> tools = new HashMap<>();
+        tools.put("RegularTool", toolWithoutCache);
+
+        Map<String, String> parameters = new HashMap<>();
+        String toolTemplate =
+            "{\"toolSpec\":{\"name\":\"${tool.name}\",\"description\":\"${tool.description}\",\"inputSchema\":{\"json\":${tool.attributes.input_schema}}${tool.attributes.cache_control:-}}}";
+        parameters.put(TOOL_TEMPLATE, toolTemplate);
+
+        List<String> inputTools = Arrays.asList("RegularTool");
+        String prompt = "test prompt";
+
+        AgentUtils.addToolsToFunctionCalling(tools, parameters, inputTools, prompt);
+
+        String result = parameters.get(TOOLS);
+        assertFalse(result.contains("cacheControl"));
+    }
+
+    @Test
+    public void testAddToolsToFunctionCalling_InvalidCacheTTL() {
+        // Create tool with invalid TTL
+        Map<String, Object> attributes = new HashMap<>();
+        attributes.put("input_schema", "{\"type\":\"object\"}");
+        attributes.put("cache_type", "ephemeral");
+        attributes.put("cache_ttl", "invalid");
+
+        Tool toolWithInvalidCache = mock(Tool.class);
+        when(toolWithInvalidCache.getName()).thenReturn("InvalidCacheTool");
+        when(toolWithInvalidCache.getDescription()).thenReturn("Tool with invalid cache TTL");
+        when(toolWithInvalidCache.getAttributes()).thenReturn(attributes);
+
+        Map<String, Tool> tools = new HashMap<>();
+        tools.put("InvalidCacheTool", toolWithInvalidCache);
+
+        Map<String, String> parameters = new HashMap<>();
+        String toolTemplate =
+            "{\"toolSpec\":{\"name\":\"${tool.name}\",\"description\":\"${tool.description}\",\"inputSchema\":{\"json\":${tool.attributes.input_schema}}${tool.attributes.cache_control:-}}}";
+        parameters.put(TOOL_TEMPLATE, toolTemplate);
+
+        List<String> inputTools = Arrays.asList("InvalidCacheTool");
+        String prompt = "test prompt";
+
+        AgentUtils.addToolsToFunctionCalling(tools, parameters, inputTools, prompt);
+
+        String result = parameters.get(TOOLS);
+        // Should not include cacheControl if TTL is invalid
+        assertFalse(result.contains("cacheControl"));
     }
 
     private static MLToolSpec buildTool(String name) {
